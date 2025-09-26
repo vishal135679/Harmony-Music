@@ -6,7 +6,6 @@ import 'package:get/get.dart' as getx;
 import 'package:hive/hive.dart';
 
 import '/models/album.dart';
-import '/models/playlist.dart';
 import '/services/utils.dart';
 import '../utils/helper.dart';
 import 'constant.dart';
@@ -47,12 +46,71 @@ class MusicServices extends getx.GetxService {
 
   final dio = Dio();
 
-  /// -------------------- Queue Variables --------------------
-  List<dynamic> _queue = []; // Tracks queued songs
-  int _queueIndex = 0; // Position in queue
+  // ---------------------- Queue variables & helpers ----------------------
+  // In-memory queue for playback (keeps order songs were added)
+  final List<dynamic> _queue = <dynamic>[];
+  int _queueIndex = 0;
 
-  /// -------------------- Init Method --------------------
+  /// Returns the next queued track in-order. If queue exhausted and shuffle==true,
+  /// returns a random pick from the playlist passed earlier (if used). Otherwise null.
+  dynamic getNextFromQueue({bool shuffle = false}) {
+    if (_queueIndex < _queue.length) {
+      final track = _queue[_queueIndex];
+      _queueIndex++;
+      return track;
+    }
+
+    if (shuffle && _queue.isNotEmpty) {
+      final randomIndex =
+          DateTime.now().millisecondsSinceEpoch % _queue.length;
+      return _queue[randomIndex];
+    }
+
+    return null;
+  }
+
+  /// Add tracks to the in-memory queue. If addToTop = true they are placed in front.
+  void addToQueue(List<dynamic> tracks, {bool addToTop = false}) {
+    // Annotate dateAdded for new tracks so UI sorting by date-added works
+    final int ts = DateTime.now().millisecondsSinceEpoch;
+    for (var t in tracks) {
+      try {
+        if (t is Map && !(t.containsKey('dateAdded'))) {
+          t['dateAdded'] = ts;
+        }
+      } catch (_) {
+        // ignore if track isn't a Map or can't be annotated
+      }
+    }
+
+    if (addToTop) {
+      _queue.insertAll(0, tracks);
+      // adjust index to keep currently playing position consistent.
+      _queueIndex = 0;
+    } else {
+      _queue.addAll(tracks);
+    }
+  }
+
+  void clearQueue() {
+    _queue.clear();
+    _queueIndex = 0;
+  }
+
+  /// Ensure tracks have dateAdded key (if missing set to 0)
+  void assignDateAddedIfMissing(List<dynamic> tracks) {
+    for (var t in tracks) {
+      try {
+        if (t is Map) {
+          t['dateAdded'] = t['dateAdded'] ?? 0;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // -------------------- Init / visitor id / HTTP --------------------
   Future<void> init() async {
+    //check visitor id in data base, if not generate one , set lang code
     final date = DateTime.now();
     _context['context']['client']['clientVersion'] =
         "1.${date.year}${date.month.toString().padLeft(2, '0')}${date.day.toString().padLeft(2, '0')}.01.00";
@@ -71,19 +129,24 @@ class MusicServices extends getx.GetxService {
           'id': visitorData['id'],
           'exp': DateTime.now().millisecondsSinceEpoch ~/ 1000 + 2590200
         });
+        printINFO("Got Visitor id ($visitorData['id']) from Box");
         return;
       }
     }
 
     final visitorId = await genrateVisitorId();
-    _headers['X-Goog-Visitor-Id'] =
-        visitorId ?? "CgttN24wcmd5UzNSWSi2lvq2BjIKCgJKUBIEGgAgYQ%3D%3D";
     if (visitorId != null) {
+      _headers['X-Goog-Visitor-Id'] = visitorId;
+      printINFO("New Visitor id generated ($visitorId)");
       appPrefsBox.put("visitorId", {
         'id': visitorId,
         'exp': DateTime.now().millisecondsSinceEpoch ~/ 1000 + 2592000
       });
+      return;
     }
+    // not able to generate in that case
+    _headers['X-Goog-Visitor-Id'] =
+        visitorId ?? "CgttN24wcmd5UzNSWSi2lvq2BjIKCgJKUBIEGgAgYQ%3D%3D";
   }
 
   set hlCode(String code) {
@@ -109,6 +172,7 @@ class MusicServices extends getx.GetxService {
 
   Future<Response> _sendRequest(String action, Map<dynamic, dynamic> data,
       {additionalParams = ""}) async {
+    //print("$baseUrl$action$fixedParms$additionalParams          data:$data");
     try {
       final response =
           await dio.post("$baseUrl$action$fixedParms$additionalParams",
@@ -128,40 +192,55 @@ class MusicServices extends getx.GetxService {
     }
   }
 
-  /// -------------------- QUEUE METHODS --------------------
-  dynamic getNextTrack({bool shuffle = false}) {
-    if (_queueIndex < _queue.length) {
-      return _queue[_queueIndex++];
+  // Future<List<Map<String, dynamic>>>
+  Future<dynamic> getHome({int limit = 4}) async {
+    final data = Map.from(_context);
+    data["browseId"] = "FEmusic_home";
+    final response = await _sendRequest("browse", data);
+    final results = nav(response.data, single_column_tab + section_list);
+    final home = [...parseMixedContent(results)];
+
+    final sectionList =
+        nav(response.data, single_column_tab + ['sectionListRenderer']);
+    //inspect(sectionList);
+    //print(sectionList.containsKey('continuations'));
+    if (sectionList.containsKey('continuations')) {
+      requestFunc(additionalParams) async {
+        return (await _sendRequest("browse", data,
+                additionalParams: additionalParams))
+            .data;
+      }
+
+      parseFunc(contents) => parseMixedContent(contents);
+      final x = (await getContinuations(sectionList, 'sectionListContinuation',
+          limit - home.length, requestFunc, parseFunc));
+      // inspect(x);
+      home.addAll([...x]);
     }
 
-    if (shuffle && _queue.isNotEmpty) {
-      final randomIndex = (DateTime.now().millisecondsSinceEpoch) % _queue.length;
-      return _queue[randomIndex];
-    }
-
-    return null; // Queue finished
+    return home;
   }
 
-  void addToQueue(List<dynamic> tracks, {bool addToTop = false}) {
-    // Assign dateAdded to each track
-    final timestamp = DateTime.now().millisecondsSinceEpoch;
-    for (var track in tracks) {
-      track['dateAdded'] = timestamp;
+  Future<List<Map<String, dynamic>>> getCharts({String? countryCode}) async {
+    final List<Map<String, dynamic>> charts = [];
+    final data = Map.from(_context);
+
+    data['browseId'] = 'FEmusic_charts';
+    if (countryCode != null) {
+      data['formData'] = {
+        'selectedValues': [countryCode]
+      };
+    }
+    final response = (await _sendRequest('browse', data)).data;
+    final results = nav(response, single_column_tab + section_list);
+    results.removeAt(0);
+    for (dynamic result in results) {
+      charts.add(parseChartsItem(result));
     }
 
-    if (addToTop) {
-      _queue = [...tracks, ..._queue];
-    } else {
-      _queue.addAll(tracks);
-    }
+    return charts;
   }
 
-  void clearQueue() {
-    _queue.clear();
-    _queueIndex = 0;
-  }
-
-  /// -------------------- PLAYLIST / SONG FETCH --------------------
   Future<Map<String, dynamic>> getWatchPlaylist(
       {String videoId = "",
       String? playlistId,
@@ -170,16 +249,17 @@ class MusicServices extends getx.GetxService {
       bool shuffle = false,
       String? additionalParamsNext,
       bool onlyRelated = false}) async {
+    if (videoId.isNotEmpty && videoId.substring(0, 4) == "MPED") {
+      videoId = videoId.substring(4);
+    }
     final data = Map.from(_context);
     data['enablePersistentPlaylistPanel'] = true;
     data['isAudioOnly'] = true;
     data['tunerSettingValue'] = 'AUTOMIX_SETTING_NORMAL';
-
     if (videoId == "" && playlistId == null) {
       throw Exception(
           "You must provide either a video id, a playlist id, or both");
     }
-
     if (videoId != "") {
       data['videoId'] = videoId;
       playlistId ??= "RDAMVM$videoId";
@@ -198,7 +278,6 @@ class MusicServices extends getx.GetxService {
     data['playlistId'] = playlistId;
     final isPlaylist =
         playlistId.startsWith('PL') || playlistId.startsWith('OLA');
-
     if (shuffle) {
       data['params'] = "wAEB8gECKAE%3D";
     }
@@ -207,6 +286,8 @@ class MusicServices extends getx.GetxService {
     }
 
     final List<dynamic> tracks = [];
+    dynamic lyricsBrowseId, relatedBrowseId, playlist;
+    final results = {};
 
     if (additionalParamsNext == null) {
       final response = (await _sendRequest("next", data)).data;
@@ -217,7 +298,6 @@ class MusicServices extends getx.GetxService {
         'watchNextTabbedResultsRenderer'
       ]);
 
-      dynamic lyricsBrowseId, relatedBrowseId, playlist;
       lyricsBrowseId = getTabBrowseId(watchNextRenderer, 1);
       relatedBrowseId = getTabBrowseId(watchNextRenderer, 2);
       if (onlyRelated) {
@@ -227,13 +307,12 @@ class MusicServices extends getx.GetxService {
         };
       }
 
-      final results = nav(watchNextRenderer, [
+      results.addAll(nav(watchNextRenderer, [
         ...tab_content,
         'musicQueueRenderer',
         'content',
         'playlistPanelRenderer'
-      ]);
-
+      ]));
       playlist = results['contents']
           .map((content) => nav(content,
               ['playlistPanelVideoRenderer', ...navigation_playlist_id]))
@@ -241,48 +320,637 @@ class MusicServices extends getx.GetxService {
           .toList()
           .first;
 
+      // fetch initial batch
       final fetchedTracks = parseWatchPlaylist(results['contents']);
 
-      // ------------------- QUEUE ADD -------------------
-      if (!shuffle) {
-        addToQueue(fetchedTracks, addToTop: false); // Normal order
-      } else {
-        addToQueue(fetchedTracks, addToTop: true); // Shuffle later
-      }
+      // assign dateAdded if missing and add to queue (preserve order)
+      assignDateAddedIfMissing(fetchedTracks);
+      // Add to queue in-order when shuffle is off;
+      // if shuffle true we still add them (shuffle logic at playback layer)
+      addToQueue(fetchedTracks, addToTop: false);
 
       tracks.addAll(fetchedTracks);
     }
 
-    // ----------- CONTINUATIONS HANDLING -------------
-    if (tracks.length < limit) {
-      dynamic additionalParamsForNext;
-      final x = await getContinuations(
-          {}, 'playlistPanelContinuation', limit - tracks.length,
-          (additionalParams) async =>
-              (await _sendRequest("next", data,
-                      additionalParams: additionalParams))
-                  .data,
-          parseWatchPlaylist,
+    dynamic additionalParamsForNext;
+    if (results.containsKey('continuations') || additionalParamsNext != null) {
+      requestFunc(additionalParams) async =>
+          (await _sendRequest("next", data, additionalParams: additionalParams))
+              .data;
+      parseFunc(contents) => parseWatchPlaylist(contents);
+      final x = await getContinuations(results, 'playlistPanelContinuation',
+          limit - tracks.length, requestFunc, parseFunc,
+          ctokenPath: isPlaylist ? '' : 'Radio',
           isAdditionparamReturnReq: true,
           additionalParams_: additionalParamsNext);
-
       additionalParamsForNext = x[1];
-      tracks.addAll(List<dynamic>.from(x[0]));
-    }
 
-    // ------------------- SORT BY DATE ADDED -------------------
-    tracks.sort((a, b) {
-      final daA = a['dateAdded'] ?? 0;
-      final daB = b['dateAdded'] ?? 0;
-      return daB.compareTo(daA); // newest first
-    });
+      // x[0] is a list of parsed tracks — annotate and queue them too
+      final contTracks = List<dynamic>.from(x[0]);
+      assignDateAddedIfMissing(contTracks);
+      addToQueue(contTracks, addToTop: false);
+
+      tracks.addAll(contTracks);
+    }
 
     return {
       'tracks': tracks,
       'playlistId': playlist,
-      'lyrics': null,
-      'related': null,
+      'lyrics': lyricsBrowseId,
+      'related': relatedBrowseId,
+      'additionalParamsForNext': additionalParamsForNext
     };
+  }
+
+  Future<String> getAlbumBrowseId(String audioPlaylistId) async {
+    final response = await dio.get("${domain}playlist",
+        options: Options(headers: _headers),
+        queryParameters: {"list": audioPlaylistId});
+    final reg = RegExp(r'\"MPRE.+?\"');
+    final matchs = reg.firstMatch(response.data.toString());
+    if (matchs != null) {
+      final x = (matchs[0])!;
+      final res = (x.substring(1)).split("\\")[0];
+      return res;
+    }
+    return audioPlaylistId;
+  }
+
+  dynamic getContentRelatedToSong(String videoId, String hlCode) async {
+    final params = await getWatchPlaylist(videoId: videoId, onlyRelated: true);
+    final data = Map.from(_context);
+    data['browseId'] = params['related'];
+    data['context']['client']['hl'] = hlCode;
+    final response = (await _sendRequest('browse', data)).data;
+    final sections = nav(response, ['contents'] + section_list);
+    final x = parseMixedContent(sections);
+    return x;
+  }
+
+  dynamic getLyrics(String browseId) async {
+    final data = Map.from(_context);
+    data['browseId'] = browseId;
+    final response = (await _sendRequest('browse', data)).data;
+    return nav(
+      response,
+      ['contents', ...section_list_item, ...description_shelf, ...description],
+    );
+  }
+
+  Future<Map<String, dynamic>> getPlaylistOrAlbumSongs(
+      {String? playlistId,
+      String? albumId,
+      int limit = 3000,
+      bool related = false,
+      int suggestionsLimit = 0}) async {
+    String browseId = playlistId != null
+        ? (playlistId.startsWith("VL") ? playlistId : "VL$playlistId")
+        : albumId!;
+    if (albumId != null && albumId.contains("OLAK5uy")) {
+      browseId = await getAlbumBrowseId(browseId);
+    }
+    final data = Map.from(_context);
+    data['browseId'] = browseId;
+    final Map<String, dynamic> response =
+        (await _sendRequest('browse', data)).data;
+    if (playlistId != null) {
+      final Map<String, dynamic> header =
+          nav(response, ['header', "musicDetailHeaderRenderer"]) ??
+              nav(response, [
+                'contents',
+                "twoColumnBrowseResultsRenderer",
+                'tabs',
+                0,
+                "tabRenderer",
+                "content",
+                "sectionListRenderer",
+                "contents",
+                0,
+                "musicResponsiveHeaderRenderer"
+              ]);
+
+      final Map<String, dynamic> results =
+          nav(response, musicPlaylistShelfRenderer) ??
+              nav(
+                response,
+                [
+                  'contents',
+                  "singleColumnBrowseResultsRenderer",
+                  "tabs",
+                  0,
+                  "tabRenderer",
+                  "content",
+                  'sectionListRenderer',
+                  'contents',
+                  0,
+                  "musicPlaylistShelfRenderer"
+                ],
+              );
+      final Map<String, dynamic> playlist = {'id': results['playlistId']};
+
+      playlist['title'] = nav(header, title_text);
+      playlist['thumbnails'] = nav(header, thumnail_cropped) ??
+          nav(header, [
+            "thumbnail",
+            "musicThumbnailRenderer",
+            "thumbnail",
+            "thumbnails"
+          ]);
+      playlist["description"] = nav(header, description);
+      final int runCount = header['subtitle']['runs'].length;
+      if (runCount > 1) {
+        playlist['author'] = {
+          'name': nav(header, subtitle2),
+          'id': nav(header, ['subtitle', 'runs', 2] + navigation_browse_id)
+        };
+        if (runCount == 5) {
+          playlist['year'] = nav(header, subtitle3);
+        }
+      }
+
+      final int secondSubtitleRunCount =
+          header['secondSubtitle']['runs'].length;
+      final String count = (((header['secondSubtitle']['runs']
+                      [secondSubtitleRunCount % 3]['text'])
+                  .split(' ')[0])
+              .split(',') as List)
+          .join();
+      final int songCount = int.parse(count);
+      if (header['secondSubtitle']['runs'].length > 1) {
+        playlist['duration'] = header['secondSubtitle']['runs']
+            [(secondSubtitleRunCount % 3) + 2]['text'];
+      }
+      playlist['trackCount'] = songCount;
+
+      requestFuncCountinuation(cont) async =>
+          (await _sendRequest("browse", {...data, ...cont})).data;
+
+      if (songCount > 0) {
+        playlist['tracks'] = parsePlaylistItems(results['contents']);
+        limit = songCount;
+
+        List<dynamic> parseFunc(contents) => parsePlaylistItems(contents);
+
+        final continuationTracks = await getContinuationsPlaylist(
+            results, limit, requestFuncCountinuation, parseFunc);
+        // annotate and queue continuation & initial tracks so dateAdded is present
+        assignDateAddedIfMissing(playlist['tracks']);
+        addToQueue(List<dynamic>.from(playlist['tracks']), addToTop: false);
+
+        playlist['tracks'] = [
+          ...(playlist['tracks']),
+          ...(await getContinuationsPlaylist(
+              results, limit, requestFuncCountinuation, parseFunc))
+        ];
+      }
+      playlist['duration_seconds'] = sumTotalDuration(playlist);
+      return playlist;
+    }
+
+    //album content
+    final album = parseAlbumHeader(response);
+    dynamic results = nav(
+          response,
+          [
+            'contents',
+            "twoColumnBrowseResultsRenderer",
+            "secondaryContents",
+            'sectionListRenderer',
+            'contents',
+            0,
+            'musicShelfRenderer'
+          ],
+        ) ??
+        nav(
+          response,
+          [
+            'contents',
+            "singleColumnBrowseResultsRenderer",
+            "tabs",
+            0,
+            "tabRenderer",
+            "content",
+            'sectionListRenderer',
+            'contents',
+            0,
+            "musicShelfRenderer"
+          ],
+        );
+
+    album['tracks'] = parsePlaylistItems(results['contents'],
+        artistsM: album['artists'],
+        thumbnailsM: album["thumbnails"],
+        albumIdName: {"id": albumId, 'name': album['title']},
+        albumYear: album['year'],
+        isAlbum: true);
+
+    // annotate and queue album tracks for dateAdded
+    assignDateAddedIfMissing(album['tracks']);
+    addToQueue(List<dynamic>.from(album['tracks']), addToTop: false);
+
+    results = nav(
+      response,
+      [...single_column_tab, ...section_list, 1, 'musicCarouselShelfRenderer'],
+    );
+    if (results != null) {
+      List contents = [];
+      if (results.runtimeType.toString().contains("Iterable") ||
+          results.runtimeType.toString().contains("List")) {
+        for (dynamic result in results) {
+          contents.add(parseAlbum(result['musicTwoRowItemRenderer']));
+        }
+      } else {
+        contents
+            .add(parseAlbum(results['contents'][0]['musicTwoRowItemRenderer']));
+      }
+      album['other_versions'] = contents;
+    }
+    album['duration_seconds'] = sumTotalDuration(album);
+
+    return album;
+  }
+
+  Future<List<String>> getSearchSuggestion(String queryStr) async {
+    final data = Map.from(_context);
+    data['input'] = queryStr;
+    final res = nav(
+            (await _sendRequest("music/get_search_suggestions", data)).data,
+            ['contents', 0, 'searchSuggestionsSectionRenderer', 'contents']) ??
+        [];
+    return res
+        .map<String?>((item) {
+          return (nav(item, [
+            'searchSuggestionRenderer',
+            'navigationEndpoint',
+            'searchEndpoint',
+            'query'
+          ])).toString();
+        })
+        .whereType<String>()
+        .toList();
+  }
+
+  ///Specially created for deep-links
+  Future<List> getSongWithId(String songId) async {
+    final data = Map.of(_context);
+    data['videoId'] = songId;
+    final response = (await _sendRequest("player", data)).data;
+    final category =
+        nav(response, ["microformat", "microformatDataRenderer", "category"]);
+    if (category == "Music" ||
+        (response["videoDetails"]).containsKey("musicVideoType")) {
+      final list = await getWatchPlaylist(videoId: songId);
+      return [true, list['tracks']];
+    }
+    return [false, null];
+  }
+
+  Future<Map<String, dynamic>> search(String query,
+      {String? filter,
+      String? scope,
+      int limit = 30,
+      bool ignoreSpelling = false}) async {
+    final data = Map.of(_context);
+    data['context']['client']["hl"] = 'en';
+    data['query'] = query;
+
+    final Map<String, dynamic> searchResults = {};
+    final filters = [
+      'albums',
+      'artists',
+      'playlists',
+      'community_playlists',
+      'featured_playlists',
+      'songs',
+      'videos'
+    ];
+
+    if (filter != null && !filters.contains(filter)) {
+      throw Exception(
+          'Invalid filter provided. Please use one of the following filters or leave out the parameter: ${filters.join(', ')}');
+    }
+
+    final scopes = ['library', 'uploads'];
+
+    if (scope != null && !scopes.contains(scope)) {
+      throw Exception(
+          'Invalid scope provided. Please use one of the following scopes or leave out the parameter: ${scopes.join(', ')}');
+    }
+
+    if (scope == scopes[1] && filter != null) {
+      throw Exception(
+          'No filter can be set when searching uploads. Please unset the filter parameter when scope is set to uploads.');
+    }
+
+    final params = getSearchParams(filter, scope, ignoreSpelling);
+
+    if (params != null) {
+      data['params'] = params;
+    }
+
+    final response = (await _sendRequest("search", data)).data;
+
+    if (response['contents'] == null) {
+      return searchResults;
+    }
+
+    dynamic results;
+
+    if ((response['contents']).containsKey('tabbedSearchResultsRenderer')) {
+      final tabIndex =
+          scope == null || filter != null ? 0 : scopes.indexOf(scope) + 1;
+      results = response['contents']['tabbedSearchResultsRenderer']['tabs']
+          [tabIndex]['tabRenderer']['content'];
+    } else {
+      results = response['contents'];
+    }
+
+    results = nav(results, ['sectionListRenderer', 'contents']);
+
+    if (results.length == 1 && results[0]['itemSectionRenderer'] != null) {
+      return searchResults;
+    }
+
+    String? type;
+
+    for (var res in results) {
+      String category;
+      if (res.containsKey('musicCardShelfRenderer')) {
+        //final topResult = parseTopResult(res['musicCardShelfRenderer'], ['artist', 'playlist', 'song', 'video', 'station']);
+        //searchResults.add(topResult);
+        results = nav(res, ['musicCardShelfRenderer', 'contents']);
+        if (results != null) {
+          if ((results[0]).containsKey("messageRenderer")) {
+            category = nav(results[0], ['messageRenderer', ...text_run_text]);
+            results = results.sublist(1);
+          }
+          //type = null;
+        } else {
+          continue;
+        }
+        continue;
+      } else if (res['musicShelfRenderer'] != null) {
+        results = res['musicShelfRenderer']['contents'];
+        String? typeFilter = filter;
+
+        category = nav(res, ['musicShelfRenderer', ...title_text]);
+
+        if (typeFilter == null && scope == scopes[0]) {
+          typeFilter = category;
+        }
+
+        type = typeFilter?.substring(0, typeFilter.length - 1).toLowerCase();
+      } else {
+        continue;
+      }
+
+      searchResults[category] = parseSearchResults(results,
+          ['artist', 'playlist', 'song', 'video', 'station'], type, category);
+
+      if (filter != null) {
+        requestFunc(additionalParams) async =>
+            (await _sendRequest("search", data,
+                    additionalParams: additionalParams))
+                .data;
+        parseFunc(contents) => parseSearchResults(contents,
+            ['artist', 'playlist', 'song', 'video', 'station'], type, category);
+
+        if (searchResults.containsKey(category)) {
+          final x = await getContinuations(
+              res['musicShelfRenderer'],
+              'musicShelfContinuation',
+              limit - ((searchResults[category] as List).length),
+              requestFunc,
+              parseFunc,
+              isAdditionparamReturnReq: true);
+
+          searchResults["params"] = {
+            'data': data,
+            "type": type,
+            "category": category,
+            'additionalParams': x[1],
+          };
+
+          searchResults[category] = [
+            ...(searchResults[category] as List),
+            ...(x[0])
+          ];
+        }
+      }
+    }
+
+    return searchResults;
+  }
+
+  Future<Map<String, dynamic>> getSearchContinuation(Map additionalParamsNext,
+      {int limit = 10}) async {
+    final data = additionalParamsNext['data'];
+    final type = additionalParamsNext['type'];
+    final category = additionalParamsNext['category'];
+    final Map<String, dynamic> searchResults = {};
+
+    requestFunc(additionalParams) async =>
+        (await _sendRequest("search", data, additionalParams: additionalParams))
+            .data;
+
+    parseFunc(contents) => parseSearchResults(contents,
+        ['artist', 'playlist', 'song', 'video', 'station'], type, category);
+
+    final x = await getContinuations(
+        {}, 'musicShelfContinuation', limit, requestFunc, parseFunc,
+        isAdditionparamReturnReq: true,
+        additionalParams_: additionalParamsNext['additionalParams']);
+
+    searchResults["params"] = {
+      "data": data,
+      "type": type,
+      "category": category,
+      'additionalParams': x[1],
+    };
+
+    searchResults[category] = x[0];
+
+    return searchResults;
+  }
+
+  Future<Map<String, dynamic>> getArtist(String channelId) async {
+    if (channelId.startsWith("MPLA")) {
+      channelId = channelId.substring(4);
+    }
+    final data = Map.from(_context);
+    data['context']['client']["hl"] = 'en';
+    data['browseId'] = channelId;
+    final response = (await _sendRequest("browse", data)).data;
+    final results = nav(response, [...single_column_tab, ...section_list]);
+
+    final Map<String, dynamic> artist = {'description': null, 'views': null};
+    final Map<String, dynamic> header = (response['header']
+            ['musicImmersiveHeaderRenderer']) ??
+        response['header']['musicVisualHeaderRenderer'];
+    artist['name'] = nav(header, title_text);
+    final descriptionShelf =
+        findObjectByKey(results, description_shelf[0], isKey: true);
+    if (descriptionShelf != null) {
+      artist['description'] = nav(descriptionShelf, description);
+      artist['views'] = descriptionShelf['subheader'] == null
+          ? null
+          : descriptionShelf['subheader']['runs'][0]['text'];
+    }
+    final dynamic subscriptionButton = header['subscriptionButton'] != null
+        ? header['subscriptionButton']['subscribeButtonRenderer']
+        : null;
+    artist['channelId'] = channelId;
+    artist['shuffleId'] = nav(header,
+        ['playButton', 'buttonRenderer', ...navigation_watch_playlist_id]);
+    artist['radioId'] = nav(
+      header,
+      ['startRadioButton', 'buttonRenderer'] + navigation_playlist_id,
+    );
+    artist['subscribers'] = subscriptionButton != null
+        ? nav(
+            subscriptionButton,
+            ['subscriberCountText', 'runs', 0, 'text'],
+          )
+        : null;
+
+    artist['thumbnails'] = nav(header, thumbnails);
+
+    artist.addAll(parseArtistContents(results));
+    return artist;
+  }
+
+  Future<Map<String, dynamic>> getArtistRealtedContent(
+      Map<String, dynamic> browseEndpoint, String category,
+      {String additionalParams = ""}) async {
+    final Map<String, dynamic> result = {
+      "results": [],
+    };
+    final data = Map.of(_context);
+    browseEndpoint.remove("content");
+    if (browseEndpoint.isEmpty) return result;
+    data.addAll(browseEndpoint);
+    final response =
+        (await _sendRequest("browse", data, additionalParams: additionalParams))
+            .data;
+    final contents = nav(response, [
+      'contents',
+      'singleColumnBrowseResultsRenderer',
+      'tabs',
+      0,
+      'tabRenderer',
+      'content',
+      'sectionListRenderer',
+      'contents',
+      0,
+    ]);
+
+    if (category == "Songs" || category == "Videos") {
+      if (additionalParams != "") {
+        final contentList = nav(response, [
+          "onResponseReceivedActions",
+          0,
+          "appendContinuationItemsAction",
+          "continuationItems"
+        ]);
+        final x = parsePlaylistItems(contentList);
+        result['results'] = x;
+        result['additionalParams'] = "&ctoken=${null}&continuation=${null}";
+      } else if (contents.containsKey("gridRenderer")) {
+        result['results'] = (contents['gridRenderer']['items'])
+            .map((video) => parseVideo(video['musicTwoRowItemRenderer']))
+            .toList();
+        result['additionalParams'] = "&ctoken=${null}&continuation=${null}";
+      } else {
+        final collapseContent =
+            nav(contents, ['musicPlaylistShelfRenderer', "collapsedItemCount"]);
+        if (collapseContent != null) {
+          final contentlist =
+              contents['musicPlaylistShelfRenderer']['contents'];
+          if (contentlist.length.toString() != collapseContent.toString()) {
+            final continuationItem = contentlist.removeAt(100);
+            result['results'] = parsePlaylistItems(contentlist);
+            final continuationKey = nav(continuationItem, [
+              "continuationItemRenderer",
+              "continuationEndpoint",
+              "continuationCommand",
+              "token"
+            ]);
+            result['additionalParams'] =
+                "&ctoken=$continuationKey&continuation=$continuationKey";
+          } else {
+            result['results'] = parsePlaylistItems(contentlist);
+            result['additionalParams'] = "&ctoken=null&continuation=null";
+          }
+        }
+        return result;
+      }
+    } else if (category == 'Albums' || category == 'Singles') {
+      List contentlist;
+
+      /// in continuation
+      if (additionalParams != "") {
+        contentlist =
+            response['continuationContents']['gridContinuation']['items'];
+        final continuationKey = nav(response, [
+          'continuationContents',
+          'gridContinuation',
+          'continuations',
+          0,
+          'nextContinuationData',
+          'continuation'
+        ]);
+        result['additionalParams'] =
+            "&ctoken=$continuationKey&continuation=$continuationKey";
+      } else {
+        /// in first request
+        contentlist = contents['gridRenderer']['items'];
+
+        final continuationKey = nav(contents, [
+          'gridRenderer',
+          'continuations',
+          0,
+          'nextContinuationData',
+          'continuation'
+        ]);
+        result['additionalParams'] =
+            "&ctoken=$continuationKey&continuation=$continuationKey";
+      }
+
+      result['results'] = category == 'Albums'
+          ? contentlist
+              .map((item) => parseAlbum(item['musicTwoRowItemRenderer']))
+              .whereType<Album>()
+              .toList()
+          : contentlist
+              .map((item) => parseSingle(item['musicTwoRowItemRenderer']))
+              .whereType<Album>()
+              .toList();
+    }
+    return result;
+  }
+
+  Future<String?> getSongYear(String songId) async {
+    final data = Map.from(_context);
+    data['browseId'] = "MPTC$songId";
+    try {
+      final response = (await _sendRequest('browse', data)).data;
+      String? year = nav(response, [
+        "onResponseReceivedActions",
+        0,
+        "openPopupAction",
+        "popup",
+        "dismissableDialogRenderer",
+        "metadata",
+        "musicMultiRowListItemRenderer",
+        "secondTitle",
+        "runs",
+        2,
+        "text"
+      ]);
+      return year;
+    } catch (e) {
+      rethrow;
+    }
   }
 
   @override
